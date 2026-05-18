@@ -30,6 +30,7 @@ import java.util.Collection;
 import java.util.LinkedList;
 import java.util.Queue;
 
+import jdk.graal.compiler.nodes.calc.BinaryNode;
 import org.graalvm.collections.EconomicMap;
 import org.graalvm.collections.EconomicSet;
 import org.graalvm.collections.Equivalence;
@@ -617,6 +618,7 @@ public class Loop {
                 InductionVariable iv = null;
                 ValueNode offset = calcOffsetTo(this, op, baseIvNode, true);
                 ValueNode scale;
+                InductionVariable ivScale;
                 InductionVariable  ivAsOffset = calcOffsetTo(this, op, baseIvNode , currentIvs);
                 if(ivAsOffset!=null)
                 {
@@ -629,7 +631,14 @@ public class Loop {
                     iv = new DerivedScaledInductionVariable(this, baseIv, (NegateNode) op);
                 } else if ((scale = calcScaleTo(this, op, baseIvNode)) != null) {
                     iv = new DerivedScaledInductionVariable(this, baseIv, scale, op);
-                } else {
+                }
+                else if ((ivScale = calcIVScaleTo(this, op, baseIvNode, currentIvs))!=null){
+                    // NEW: check if op is base * another known I
+                    if ( op instanceof BinaryNode bin) {
+                        iv = new DerivedIVScaledInductionVariable(this, baseIv, ivScale, bin);
+                    }
+
+                }else {
                     boolean isValidConvert = op instanceof PiNode || op instanceof SignExtendNode;
                     if (!isValidConvert && op instanceof ZeroExtendNode) {
                         ZeroExtendNode zeroExtendNode = (ZeroExtendNode) op;
@@ -900,7 +909,42 @@ public class Loop {
         }
         return null;
     }
+    /**
+     * Checks if op is of the form:
+     *   base * someIV   (MulNode)
+     *   base << someIV  (LeftShiftNode where shift amount is an IV)
+     *
+     * Returns the IV used as scale/shift, or null if not applicable.
+     */
+    private static InductionVariable calcIVScaleTo(Loop loop, ValueNode op,
+                                                   ValueNode base,
+                                                   EconomicMap<Node, InductionVariable> knownIVs) {
+        if (op instanceof MulNode mul) {
+            // base * scaleIV
+            if (mul.getX() == base && !loop.isOutsideLoop(mul.getY())
+                    && knownIVs.containsKey(mul.getY())) {
+                return knownIVs.get(mul.getY());
+            }
+            // scaleIV * base (commutative)
+            if (mul.getY() == base && !loop.isOutsideLoop(mul.getX())
+                    && knownIVs.containsKey(mul.getX())) {
+                return knownIVs.get(mul.getX());
+            }
+        }
 
+        if (op instanceof LeftShiftNode shift) {
+            // base << scaleIV  (shift amount is an IV, not a constant)
+            // Note: constant shift is handled by existing calcScaleTo already
+            if (shift.getX() == base
+                    && !shift.getY().isConstant()
+                    && !loop.isOutsideLoop(shift.getY())
+                    && knownIVs.containsKey(shift.getY())) {
+                return knownIVs.get(shift.getY());
+            }
+        }
+
+        return null;
+    }
     /**
      * Deletes any nodes created within the scope of this object that have no usages.
      */
