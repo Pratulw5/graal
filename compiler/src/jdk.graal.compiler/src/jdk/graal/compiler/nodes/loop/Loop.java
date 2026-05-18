@@ -617,6 +617,12 @@ public class Loop {
                 InductionVariable iv = null;
                 ValueNode offset = calcOffsetTo(this, op, baseIvNode, true);
                 ValueNode scale;
+                InductionVariable  ivAsOffset = calcOffsetTo(this, op, baseIvNode , currentIvs);
+                if(ivAsOffset!=null)
+                {
+                    iv = new DerivedLinearCombinationInductionVariable(
+                            this, baseIv, ivAsOffset, (BinaryArithmeticNode<?>) op);
+                }
                 if (offset != null) {
                     iv = new DerivedOffsetInductionVariable(this, baseIv, offset, (BinaryArithmeticNode<?>) op);
                 } else if (op instanceof NegateNode) {
@@ -846,6 +852,30 @@ public class Loop {
         return null;
     }
 
+
+
+    private static InductionVariable calcOffsetTo(Loop loop, ValueNode opNode, ValueNode base,
+                                                    EconomicMap<Node, InductionVariable> knownIVs) {
+        if (isNumericInteger(opNode) && (opNode instanceof AddNode || opNode instanceof SubNode)) {
+            BinaryArithmeticNode<?> arithOp = (BinaryArithmeticNode<?>) opNode;
+            BinaryOp<?> op = arithOp.getArithmeticOp();
+
+            if (arithOp.getX() == base) {
+                ValueNode other = arithOp.getY();
+                // other must be a known IV, NOT loop invariant
+                // loop invariant case is handled by original calcOffsetTo
+                if (!loop.isOutsideLoop(other) && knownIVs.containsKey(other)) {
+                    return knownIVs.get(other);
+                }
+            } else if ((op.isCommutative() || true) && arithOp.getY() == base) {
+                ValueNode other = arithOp.getX();
+                if (!loop.isOutsideLoop(other) && knownIVs.containsKey(other)) {
+                    return knownIVs.get(other);
+                }
+            }
+        }
+        return null;
+    }
     /**
      * Determine if the given {@code op} represents a {@code DerivedScaledInductionVariable}
      * variable with respect to {@code base}.
