@@ -620,7 +620,7 @@ public class Loop {
                 InductionVariable  ivAsOffset = calcOffsetTo(this, op, baseIvNode , currentIvs);
                 if(ivAsOffset!=null)
                 {
-                    iv = new DerivedLinearCombinationInductionVariable(
+                    iv = new DerivedIVOffsetInductionVariable(
                             this, baseIv, ivAsOffset, (BinaryArithmeticNode<?>) op);
                 }
                 if (offset != null) {

@@ -1,26 +1,25 @@
 package jdk.graal.compiler.loop.phases;
+
 import jdk.graal.compiler.nodes.PhiNode;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.loop.CountedLoopInfo;
 import jdk.graal.compiler.nodes.loop.InductionVariable;
 import jdk.graal.compiler.nodes.loop.Loop;
 import jdk.graal.compiler.nodes.loop.LoopPolicies;
 import jdk.graal.compiler.nodes.loop.LoopsData;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.phases.common.CanonicalizerPhase;
-import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.loop.BasicInductionVariable;
 import jdk.graal.compiler.nodes.loop.DerivedConvertedInductionVariable;
 import jdk.graal.compiler.nodes.loop.DerivedOffsetInductionVariable;
 import jdk.graal.compiler.nodes.loop.DerivedScaledInductionVariable;
-import jdk.graal.compiler.nodes.loop.DerivedLinearCombinationInductionVariable;
+import jdk.graal.compiler.nodes.loop.DerivedIVOffsetInductionVariable;
 import jdk.graal.compiler.nodes.LoopExitNode;
-import jdk.graal.compiler.nodes.ValuePhiNode;
 import jdk.graal.compiler.nodes.ValueProxyNode;
 import jdk.graal.compiler.nodes.loop.DerivedInductionVariable;
+import jdk.graal.compiler.nodes.NodeView;
 import jdk.graal.compiler.nodes.FrameState;
 
 public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
@@ -30,7 +29,8 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
     }
 
     /**
-     * Finds or creates a ValueProxyNode for the given value at the given loop exit.
+     * Finds an existing ValueProxyNode for the given value at the given loop exit,
+     * or creates a new one if none exists.
      */
     private ValueProxyNode getOrCreateProxy(ValueNode value, LoopExitNode loopExit,
                                             PhiNode phi, DebugContext debug) {
@@ -42,37 +42,22 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
         ValueProxyNode proxy = phi.graph().addWithoutUnique(
                 new ValueProxyNode(value, loopExit));
         debug.log(DebugContext.INFO_LEVEL,
-                "     [Replace] Created new proxy %s for value %s at exit %s",
+                "     [Proxy] Created proxy %s for value %s at exit %s",
                 proxy, value, loopExit);
         return proxy;
     }
 
     /**
-     * Tries to replace the PhiNode fed by a derived IV with a post-loop computation using
-     * the extremum (last body value) of the loop-controlling base IV.
+     * Tries to replace a PhiNode fed by a derived IV with a direct computation
+     * using the live IV value proxied at the loop exit.
      *
-     * This only applies when the root base IV of the derived IV is the loop-controlling IV
-     * (limitCheckedIV), because only then do we know the extremum precisely.
-     *
-     * We use the extremum — the value of the IV in the last loop body execution — rather than
-     * the exit value, because the inner code runs only during the last body iteration, not after
-     * the loop condition exits.
+     * Works uniformly for both counted and uncounted loops by proxying the live
+     * base IV value at the loop exit — no need for extremumNode().
      */
     private void tryReplaceDerivedIVPhi(Loop loop, InductionVariable anyIv,
-                                        InductionVariable limitCheckedIV,
                                         DebugContext debug) {
 
         if (!(anyIv instanceof DerivedInductionVariable derivedIv)) {
-            return;
-        }
-
-        // Only handle derived IVs whose root base is the loop-controlling IV.
-        // Walk up the base chain to find the root basic IV.
-        InductionVariable rootIv = derivedIv.getRootIV();
-        if (rootIv != limitCheckedIV) {
-            debug.log(DebugContext.INFO_LEVEL,
-                    "     [Replace] Skipping derived IV %s — root IV %s is not the limit-checked IV %s",
-                    anyIv.valueNode(), rootIv.valueNode(), limitCheckedIV.valueNode());
             return;
         }
 
@@ -81,14 +66,11 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
                 continue;
             }
 
+            // Only replace if ALL non-FrameState, non-proxy usages of the phi are outside the loop
             boolean allOutside = true;
             for (Node phiUsage : phi.usages()) {
-                if (phiUsage instanceof FrameState) {
-                    continue;
-                }
-                if (phiUsage instanceof ValueProxyNode) {
-                    continue;
-                }
+                if (phiUsage instanceof FrameState) continue;
+                if (phiUsage instanceof ValueProxyNode) continue;
                 if (!loop.isOutsideLoop(phiUsage)) {
                     allOutside = false;
                     break;
@@ -96,10 +78,11 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
             }
             if (!allOutside) {
                 debug.log(DebugContext.INFO_LEVEL,
-                        "     [Replace] PhiNode %s skipped — has usages inside loop", phi);
+                        "     [Skip] PhiNode %s has usages inside loop", phi);
                 continue;
             }
 
+            // Find the existing ValueProxyNode for this phi at the loop exit
             ValueProxyNode proxy = null;
             for (Node phiUsage : phi.usages()) {
                 if (phiUsage instanceof ValueProxyNode vpn) {
@@ -107,67 +90,46 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
                     break;
                 }
             }
-
             if (proxy == null) {
                 debug.log(DebugContext.INFO_LEVEL,
-                        "     [Replace] No ValueProxyNode found for PhiNode %s — skipping", phi);
+                        "     [Skip] No ValueProxyNode found for PhiNode %s", phi);
                 continue;
             }
 
             LoopExitNode loopExit = proxy.proxyPoint();
-
-            // Use the extremum of the base IV (value at last body iteration),
-            // not the exit value (which is the value after the loop condition fires).
-            // The inner code only executes during the last body iteration.
-            CountedLoopInfo countedInfo = loop.counted();
             ValueNode exitValue = null;
 
-            if (derivedIv instanceof DerivedLinearCombinationInductionVariable linear) {
-                // Both base IVs must be rooted in the limit-checked IV (already guaranteed above
-                // for the outer derivedIv; check the second IV's root too).
-                InductionVariable secondRootIv = linear.getSecondIV().getRootIV();
-                if (secondRootIv != limitCheckedIV) {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     [Replace] Linear combination second IV root %s is not limit-checked IV — skipping",
-                            secondRootIv.valueNode());
-                    continue;
-                }
-
-                // Extremum of the base IV in the stamp of the base IV node.
-                ValueNode baseExtremum = linear.getBase().extremumNode(
-                        false, linear.getBase().valueNode().stamp(NodeView.DEFAULT));
-                ValueNode secondExtremum = linear.getSecondIV().extremumNode(
-                        false, linear.getSecondIV().valueNode().stamp(NodeView.DEFAULT));
-
-                ValueProxyNode baseProxy = getOrCreateProxy(baseExtremum, loopExit, phi, debug);
-                ValueProxyNode secondProxy = getOrCreateProxy(secondExtremum, loopExit, phi, debug);
-
+            if (derivedIv instanceof DerivedIVOffsetInductionVariable linear) {
+                // Proxy live values of both IVs at the loop exit
+                ValueProxyNode baseProxy = getOrCreateProxy(
+                        linear.getBase().valueNode(), loopExit, phi, debug);
+                ValueProxyNode secondProxy = getOrCreateProxy(
+                        linear.getSecondIV().valueNode(), loopExit, phi, debug);
                 exitValue = phi.graph().addOrUniqueWithInputs(
                         linear.op(baseProxy, secondProxy));
-
                 debug.log(DebugContext.INFO_LEVEL,
-                        "     [Replace] Linear combination: base extremum proxy=%s second extremum proxy=%s result=%s",
+                        "     [Linear] base proxy=%s  second proxy=%s  result=%s",
                         baseProxy, secondProxy, exitValue);
 
             } else {
-                // Extremum of the direct base IV.
-                ValueNode baseExtremum = derivedIv.getBase().extremumNode(
-                        false, derivedIv.getBase().valueNode().stamp(NodeView.DEFAULT));
-
-                debug.log(DebugContext.INFO_LEVEL,
-                        "     [Replace] Using base extremum %s (last body value) for derived IV %s",
-                        baseExtremum, anyIv.valueNode());
-
-                ValueProxyNode baseProxy = getOrCreateProxy(baseExtremum, loopExit, phi, debug);
+                // For all other derived IVs, proxy the base IV's live value at exit
+                ValueProxyNode baseProxy = getOrCreateProxy(
+                        derivedIv.getBase().valueNode(), loopExit, phi, debug);
 
                 if (derivedIv instanceof DerivedScaledInductionVariable scaled) {
                     exitValue = phi.graph().addOrUniqueWithInputs(
                             jdk.graal.compiler.nodes.loop.MathUtil.mul(
                                     phi.graph(), baseProxy, scaled.getScale()));
+                    debug.log(DebugContext.INFO_LEVEL,
+                            "     [Scaled] base proxy=%s  scale=%s  result=%s",
+                            baseProxy, scaled.getScale(), exitValue);
 
                 } else if (derivedIv instanceof DerivedOffsetInductionVariable offset) {
                     exitValue = phi.graph().addOrUniqueWithInputs(
                             offset.op(baseProxy, offset.getOffset()));
+                    debug.log(DebugContext.INFO_LEVEL,
+                            "     [Offset] base proxy=%s  offset=%s  result=%s",
+                            baseProxy, offset.getOffset(), exitValue);
 
                 } else if (derivedIv instanceof DerivedConvertedInductionVariable converted) {
                     exitValue = phi.graph().addOrUniqueWithInputs(
@@ -176,10 +138,13 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
                                     converted.valueNode().stamp(NodeView.DEFAULT),
                                     phi.graph(),
                                     NodeView.DEFAULT));
+                    debug.log(DebugContext.INFO_LEVEL,
+                            "     [Converted] base proxy=%s  stamp=%s  result=%s",
+                            baseProxy, converted.valueNode().stamp(NodeView.DEFAULT), exitValue);
 
                 } else {
                     debug.log(DebugContext.INFO_LEVEL,
-                            "     [Replace] Unhandled derived IV type %s — skipping",
+                            "     [Skip] Unhandled derived IV type %s",
                             derivedIv.getClass().getSimpleName());
                     continue;
                 }
@@ -187,143 +152,56 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
 
             if (exitValue == null) {
                 debug.log(DebugContext.INFO_LEVEL,
-                        "     [Replace] exit value computation returned null for %s — skipping",
-                        anyIv);
+                        "     [Skip] exit value is null for %s", anyIv);
                 continue;
             }
 
-            debug.log(DebugContext.INFO_LEVEL,
-                    "     [Replace] Replacing proxy input with last-body-iteration value %s", exitValue);
             proxy.replaceFirstInput(proxy.value(), exitValue);
             debug.log(DebugContext.INFO_LEVEL,
-                    "     [Replace] Done — phi %s now fed by last-body-iteration value %s", phi, exitValue);
+                    "     [Done] phi %s now fed by exit value %s", phi, exitValue);
         }
     }
 
     @Override
     protected void run(StructuredGraph graph, CoreProviders context) {
-
         if (graph.hasLoops()) {
             LoopsData data = context.getLoopsDataProvider().getLoopsData(graph);
             data.detectCountedLoops();
 
             DebugContext debug = graph.getDebug();
 
-            for (Loop loop : data.countedLoops()) {
-                CountedLoopInfo countedInfo = loop.counted();
-                if (countedInfo == null) {
-                    continue;
-                }
-
-                debug.log(DebugContext.INFO_LEVEL, "==================================================");
+            for (Loop loop : data.loops()) {
                 debug.log(DebugContext.INFO_LEVEL,
-                        "[LoopFolding] Inspecting Loop: %s", loop.getCFGLoop().getHeader());
+                        "  [Loop] %s  counted=%b  IVs=%d",
+                        loop, loop.counted() != null, loop.getInductionVariables().size());
 
-                InductionVariable iv = countedInfo.getLimitCheckedIV();
-                debug.log(DebugContext.INFO_LEVEL, "  -> Primary IV: %s", iv.valueNode());
-                debug.log(DebugContext.INFO_LEVEL, "     Direction:  %s", iv.direction());
-                debug.log(DebugContext.INFO_LEVEL, "     Stride:     %s", iv.strideNode());
-                debug.log(DebugContext.INFO_LEVEL, "     Init:       %s", iv.initNode());
-                debug.log(DebugContext.INFO_LEVEL, "     Limit:      %s", countedInfo.getLimit());
-                debug.log(DebugContext.INFO_LEVEL, "     Exit Value: %s", countedInfo.getBodyIVExitValue());
-
-                if (countedInfo.loopCanNeverOverflow()) {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     Extremum:   %s", countedInfo.getBodyIVExtremum());
-                } else {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     Extremum:   (skipped — overflow not ruled out)");
-                }
-                if (countedInfo.isConstantMaxTripCount()) {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     Trip Count: %s (constant)", countedInfo.constantMaxTripCount());
-                } else if (countedInfo.loopCanNeverOverflow()) {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     Trip Count: %s (dynamic)", countedInfo.maxTripCountNode());
-                } else {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     Trip Count: (skipped — overflow not ruled out)");
-                }
-
-                debug.log(DebugContext.INFO_LEVEL, "  -> Derived IVs:");
                 for (InductionVariable anyIv : loop.getInductionVariables().getValues()) {
-                    if (anyIv == iv) {
-                        continue;
-                    }
-                    if (anyIv instanceof BasicInductionVariable) {
-                        continue;
-                    }
+                    if (anyIv instanceof BasicInductionVariable) continue;
 
                     // Logging
-                    if (anyIv instanceof DerivedLinearCombinationInductionVariable linear) {
+                    if (anyIv instanceof DerivedIVOffsetInductionVariable linear) {
                         debug.log(DebugContext.INFO_LEVEL,
-                                "     [Linear]    node=%s  base=%s  second=%s  stride=%s  init=%s  direction=%s",
-                                linear.valueNode(),
-                                linear.getBase().valueNode(),
-                                linear.getSecondIV().valueNode(),
-                                linear.strideNode(),
-                                linear.initNode(),
-                                linear.direction());
-
+                                "     [Linear]    node=%s  base=%s  second=%s",
+                                linear.valueNode(), linear.getBase().valueNode(),
+                                linear.getSecondIV().valueNode());
                     } else if (anyIv instanceof DerivedScaledInductionVariable scaled) {
                         debug.log(DebugContext.INFO_LEVEL,
-                                "     [Scaled]    node=%s  base=%s  scale=%s  stride=%s  init=%s  direction=%s",
-                                scaled.valueNode(),
-                                scaled.getBase().valueNode(),
-                                scaled.getScale(),
-                                scaled.strideNode(),
-                                scaled.initNode(),
-                                scaled.direction());
-
+                                "     [Scaled]    node=%s  base=%s  scale=%s",
+                                scaled.valueNode(), scaled.getBase().valueNode(), scaled.getScale());
                     } else if (anyIv instanceof DerivedOffsetInductionVariable offset) {
                         debug.log(DebugContext.INFO_LEVEL,
-                                "     [Offset]    node=%s  base=%s  offset=%s  stride=%s  init=%s  direction=%s",
-                                offset.valueNode(),
-                                offset.getBase().valueNode(),
-                                offset.getOffset(),
-                                offset.strideNode(),
-                                offset.initNode(),
-                                offset.direction());
-
+                                "     [Offset]    node=%s  base=%s  offset=%s",
+                                offset.valueNode(), offset.getBase().valueNode(), offset.getOffset());
                     } else if (anyIv instanceof DerivedConvertedInductionVariable converted) {
                         debug.log(DebugContext.INFO_LEVEL,
-                                "     [Converted] node=%s  base=%s  stamp=%s  stride=%s  init=%s  direction=%s",
-                                converted.valueNode(),
-                                converted.getBase().valueNode(),
-                                converted.valueNode().stamp(NodeView.DEFAULT),
-                                converted.strideNode(),
-                                converted.initNode(),
-                                converted.direction());
-
-                    } else {
-                        debug.log(DebugContext.INFO_LEVEL,
-                                "     [Unknown]   node=%s  type=%s",
-                                anyIv.valueNode(),
-                                anyIv.getClass().getSimpleName());
+                                "     [Converted] node=%s  base=%s",
+                                converted.valueNode(), converted.getBase().valueNode());
                     }
 
-                    // Phi usage logging
-                    for (Node usageNode : anyIv.valueNode().usages()) {
-                        if (usageNode instanceof ValueProxyNode) {
-                            continue;
-                        }
-                        if (usageNode instanceof PhiNode phi) {
-                            debug.log(DebugContext.INFO_LEVEL,
-                                    "        -> used by PhiNode: %s  valueCount=%d",
-                                    phi, phi.valueCount());
-                            for (Node phiUsage : phi.usages()) {
-                                debug.log(DebugContext.INFO_LEVEL,
-                                        "           -> PhiNode used by: %s  type=%s",
-                                        phiUsage, phiUsage.getClass().getSimpleName());
-                            }
-                        }
-                    }
-
-                    // Pass limitCheckedIV so we only transform derived IVs rooted in it,
-                    // and use extremumNode (last body value) instead of exitValueNode.
-                    tryReplaceDerivedIVPhi(loop, anyIv, iv, debug);
+                    tryReplaceDerivedIVPhi(loop, anyIv, debug);
                 }
-                debug.log(DebugContext.INFO_LEVEL, "==================================================");
+                debug.log(DebugContext.INFO_LEVEL,
+                        "==================================================");
             }
         }
     }

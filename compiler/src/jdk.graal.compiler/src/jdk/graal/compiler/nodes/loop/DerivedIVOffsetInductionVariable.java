@@ -18,13 +18,13 @@ import jdk.graal.compiler.replacements.nodes.arithmetic.IntegerAddExactOverflowN
 import jdk.graal.compiler.replacements.nodes.arithmetic.IntegerSubExactOverflowNode;
 import jdk.graal.compiler.phases.common.util.LoopUtility;
 
-public class DerivedLinearCombinationInductionVariable extends DerivedInductionVariable {
+public class DerivedIVOffsetInductionVariable extends DerivedInductionVariable {
 
     private final InductionVariable secondIV;
     private final BinaryArithmeticNode<?> value;
     private final boolean baseIsSubtrahend;
 
-    public DerivedLinearCombinationInductionVariable(Loop loop,
+    public DerivedIVOffsetInductionVariable(Loop loop,
                                                      InductionVariable base,
                                                      InductionVariable secondIV,
                                                      BinaryArithmeticNode<?> value) {
@@ -317,7 +317,7 @@ public class DerivedLinearCombinationInductionVariable extends DerivedInductionV
     @Override
     public InductionVariable copy(InductionVariable newBase, ValueNode newValue) {
         if (newValue instanceof BinaryArithmeticNode<?> bin) {
-            return new DerivedLinearCombinationInductionVariable(
+            return new DerivedIVOffsetInductionVariable(
                     loop, newBase, secondIV, bin);
         }
         throw GraalError.shouldNotReachHere(
