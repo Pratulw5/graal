@@ -28,6 +28,7 @@ import static jdk.graal.compiler.phases.common.DeadCodeEliminationPhase.Optional
 
 import jdk.graal.compiler.core.common.GraalOptions;
 import jdk.graal.compiler.loop.phases.ConvertDeoptimizeToGuardPhase;
+import jdk.graal.compiler.loop.phases.LoopFoldingPhase;
 import jdk.graal.compiler.loop.phases.LoopFullUnrollPhase;
 import jdk.graal.compiler.loop.phases.LoopPeelingPhase;
 import jdk.graal.compiler.loop.phases.LoopUnswitchingPhase;
@@ -90,12 +91,16 @@ public class HighTier extends BaseTier<HighTierContext> {
 
         LoopPolicies loopPolicies = createLoopPolicies(options);
 
+
+
         if (GraalOptions.FullUnroll.getValue(options)) {
             appendPhase(new LoopFullUnrollPhase(canonicalizer, loopPolicies));
         }
-
         if (GraalOptions.LoopPeeling.getValue(options)) {
             appendPhase(new LoopPeelingPhase(loopPolicies, canonicalizer));
+        }
+        if (GraalOptions.LoopFolding.getValue(options)) {
+            appendPhase(new LoopFoldingPhase(canonicalizer, loopPolicies));
         }
 
         if (GraalOptions.LoopUnswitch.getValue(options)) {

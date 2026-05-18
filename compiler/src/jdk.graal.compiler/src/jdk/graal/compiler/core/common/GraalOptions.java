@@ -118,6 +118,9 @@ public final class GraalOptions {
     @Option(help = "Performs loop unrolling optimization. ", type = OptionType.Expert)
     public static final OptionKey<Boolean> FullUnroll = new OptionKey<>(true);
 
+    @Option(help = "Performs loop folding optimization. ", type = OptionType.Expert)
+    public static final OptionKey<Boolean> LoopFolding = new OptionKey<>(true);
+
     @Option(help = "Performs loop unswitching optimization.", type = OptionType.Expert)
     public static final OptionKey<Boolean> LoopUnswitch = new OptionKey<>(true);
 
