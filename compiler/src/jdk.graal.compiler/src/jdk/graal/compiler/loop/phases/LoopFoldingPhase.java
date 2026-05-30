@@ -5,10 +5,12 @@ import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.debug.DebugContext;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.loop.DerivedIVScaledInductionVariable;
 import jdk.graal.compiler.nodes.loop.InductionVariable;
 import jdk.graal.compiler.nodes.loop.Loop;
 import jdk.graal.compiler.nodes.loop.LoopPolicies;
 import jdk.graal.compiler.nodes.loop.LoopsData;
+import jdk.graal.compiler.nodes.loop.MathUtil;
 import jdk.graal.compiler.nodes.spi.CoreProviders;
 import jdk.graal.compiler.phases.common.CanonicalizerPhase;
 import jdk.graal.compiler.nodes.loop.BasicInductionVariable;
@@ -28,10 +30,6 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
         super(policies, canonicalizer);
     }
 
-    /**
-     * Finds an existing ValueProxyNode for the given value at the given loop exit,
-     * or creates a new one if none exists.
-     */
     private ValueProxyNode getOrCreateProxy(ValueNode value, LoopExitNode loopExit,
                                             PhiNode phi, DebugContext debug) {
         for (Node usage : value.usages()) {
@@ -47,13 +45,22 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
         return proxy;
     }
 
-    /**
-     * Tries to replace a PhiNode fed by a derived IV with a direct computation
-     * using the live IV value proxied at the loop exit.
-     *
-     * Works uniformly for both counted and uncounted loops by proxying the live
-     * base IV value at the loop exit — no need for extremumNode().
-     */
+    private ValueNode lastIterValue(BasicInductionVariable biv, LoopExitNode loopExit,
+                                    Loop loop, PhiNode phi, DebugContext debug) {
+        ValueProxyNode baseProxy = getOrCreateProxy(biv.getPhi(), loopExit, phi, debug);
+
+        boolean isNormalExit = loop.counted() != null &&
+                loopExit == loop.counted().getCountedExit();
+
+        if (isNormalExit) {
+            ValueNode stride = biv.strideNode();
+            return phi.graph().addOrUniqueWithInputs(
+                    MathUtil.sub(phi.graph(), baseProxy, stride));
+        } else {
+            return baseProxy;
+        }
+    }
+
     private void tryReplaceDerivedIVPhi(Loop loop, InductionVariable anyIv,
                                         DebugContext debug) {
 
@@ -66,7 +73,6 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
                 continue;
             }
 
-            // Only replace if ALL non-FrameState, non-proxy usages of the phi are outside the loop
             boolean allOutside = true;
             for (Node phiUsage : phi.usages()) {
                 if (phiUsage instanceof FrameState) continue;
@@ -76,13 +82,8 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
                     break;
                 }
             }
-            if (!allOutside) {
-                debug.log(DebugContext.INFO_LEVEL,
-                        "     [Skip] PhiNode %s has usages inside loop", phi);
-                continue;
-            }
+            if (!allOutside) continue;
 
-            // Find the existing ValueProxyNode for this phi at the loop exit
             ValueProxyNode proxy = null;
             for (Node phiUsage : phi.usages()) {
                 if (phiUsage instanceof ValueProxyNode vpn) {
@@ -90,76 +91,128 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
                     break;
                 }
             }
-            if (proxy == null) {
+            if (proxy == null) continue;
+
+            LoopExitNode loopExit = proxy.proxyPoint();
+
+            BasicInductionVariable rootBiv = findRootBiv(derivedIv);
+            if (rootBiv == null) {
                 debug.log(DebugContext.INFO_LEVEL,
-                        "     [Skip] No ValueProxyNode found for PhiNode %s", phi);
+                        "     [Skip] Cannot find root BasicIV for %s", derivedIv);
                 continue;
             }
 
-            LoopExitNode loopExit = proxy.proxyPoint();
-            ValueNode exitValue = null;
+            ValueNode rootLastIter = lastIterValue(rootBiv, loopExit, loop, phi, debug);
 
-            if (derivedIv instanceof DerivedIVOffsetInductionVariable linear) {
-                // Proxy live values of both IVs at the loop exit
-                ValueProxyNode baseProxy = getOrCreateProxy(
-                        linear.getBase().valueNode(), loopExit, phi, debug);
-                ValueProxyNode secondProxy = getOrCreateProxy(
-                        linear.getSecondIV().valueNode(), loopExit, phi, debug);
-                exitValue = phi.graph().addOrUniqueWithInputs(
-                        linear.op(baseProxy, secondProxy));
-                debug.log(DebugContext.INFO_LEVEL,
-                        "     [Linear] base proxy=%s  second proxy=%s  result=%s",
-                        baseProxy, secondProxy, exitValue);
-
-            } else {
-                // For all other derived IVs, proxy the base IV's live value at exit
-                ValueProxyNode baseProxy = getOrCreateProxy(
-                        derivedIv.getBase().valueNode(), loopExit, phi, debug);
-
-                if (derivedIv instanceof DerivedScaledInductionVariable scaled) {
-                    exitValue = phi.graph().addOrUniqueWithInputs(
-                            jdk.graal.compiler.nodes.loop.MathUtil.mul(
-                                    phi.graph(), baseProxy, scaled.getScale()));
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     [Scaled] base proxy=%s  scale=%s  result=%s",
-                            baseProxy, scaled.getScale(), exitValue);
-
-                } else if (derivedIv instanceof DerivedOffsetInductionVariable offset) {
-                    exitValue = phi.graph().addOrUniqueWithInputs(
-                            offset.op(baseProxy, offset.getOffset()));
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     [Offset] base proxy=%s  offset=%s  result=%s",
-                            baseProxy, offset.getOffset(), exitValue);
-
-                } else if (derivedIv instanceof DerivedConvertedInductionVariable converted) {
-                    exitValue = phi.graph().addOrUniqueWithInputs(
-                            jdk.graal.compiler.nodes.calc.IntegerConvertNode.convert(
-                                    baseProxy,
-                                    converted.valueNode().stamp(NodeView.DEFAULT),
-                                    phi.graph(),
-                                    NodeView.DEFAULT));
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     [Converted] base proxy=%s  stamp=%s  result=%s",
-                            baseProxy, converted.valueNode().stamp(NodeView.DEFAULT), exitValue);
-
-                } else {
-                    debug.log(DebugContext.INFO_LEVEL,
-                            "     [Skip] Unhandled derived IV type %s",
-                            derivedIv.getClass().getSimpleName());
-                    continue;
-                }
-            }
+            ValueNode exitValue = recomputeAtExit(derivedIv, rootBiv, rootLastIter,
+                    loopExit, loop, phi, debug);
 
             if (exitValue == null) {
                 debug.log(DebugContext.INFO_LEVEL,
-                        "     [Skip] exit value is null for %s", anyIv);
+                        "     [Skip] Could not recompute exit value for %s", derivedIv);
                 continue;
             }
 
             proxy.replaceFirstInput(proxy.value(), exitValue);
             debug.log(DebugContext.INFO_LEVEL,
-                    "     [Done] phi %s now fed by exit value %s", phi, exitValue);
+                    "     [Done] phi %s → exit value %s  (rootBiv=%s rootLastIter=%s)",
+                    phi, exitValue, rootBiv.valueNode(), rootLastIter);
         }
+    }
+
+    private static BasicInductionVariable findRootBiv(DerivedInductionVariable div) {
+        InductionVariable base = div.getBase();
+        while (base instanceof DerivedInductionVariable derived) {
+            base = derived.getBase();
+        }
+        return base instanceof BasicInductionVariable biv ? biv : null;
+    }
+
+    private ValueNode recomputeAtExit(DerivedInductionVariable derivedIv,
+                                      BasicInductionVariable rootBiv,
+                                      ValueNode rootLastIter,
+                                      LoopExitNode loopExit,
+                                      Loop loop,
+                                      PhiNode phi,
+                                      DebugContext debug) {
+
+        InductionVariable base = derivedIv.getBase();
+
+        ValueNode baseLastIter;
+        if (base instanceof BasicInductionVariable) {
+            baseLastIter = rootLastIter;
+        } else if (base instanceof DerivedInductionVariable derivedBase) {
+            baseLastIter = recomputeAtExit(derivedBase, rootBiv, rootLastIter,
+                    loopExit, loop, phi, debug);
+            if (baseLastIter == null) return null;
+        } else {
+            return null;
+        }
+
+        if (derivedIv instanceof DerivedIVOffsetInductionVariable linear) {
+            InductionVariable secondIV = linear.getSecondIV();
+            ValueNode secondLastIter;
+
+            if (secondIV instanceof BasicInductionVariable secondBiv) {
+                if (secondBiv == rootBiv) {
+                    secondLastIter = rootLastIter;
+                } else {
+                    secondLastIter = lastIterValue(secondBiv, loopExit, loop, phi, debug);
+                }
+            } else if (secondIV instanceof DerivedInductionVariable derivedSecond) {
+                BasicInductionVariable secondRoot = findRootBiv(derivedSecond);
+                if (secondRoot == rootBiv) {
+                    secondLastIter = recomputeAtExit(derivedSecond, rootBiv, rootLastIter,
+                            loopExit, loop, phi, debug);
+                } else if (secondRoot != null) {
+                    ValueNode secondRootLastIter = lastIterValue(secondRoot, loopExit, loop, phi, debug);
+                    secondLastIter = recomputeAtExit(derivedSecond, secondRoot, secondRootLastIter,
+                            loopExit, loop, phi, debug);
+                } else {
+                    return null;
+                }
+                if (secondLastIter == null) return null;
+            } else {
+                return null;
+            }
+            return phi.graph().addOrUniqueWithInputs(linear.op(baseLastIter, secondLastIter));
+
+        } else if (derivedIv instanceof DerivedIVScaledInductionVariable ivScaled) {
+            InductionVariable scaleIV = ivScaled.getScaleIV();
+            ValueNode scaleLastIter;
+            if (scaleIV instanceof BasicInductionVariable) {
+                scaleLastIter = rootLastIter;
+            } else if (scaleIV instanceof DerivedInductionVariable derivedScale) {
+                scaleLastIter = recomputeAtExit(derivedScale, rootBiv, rootLastIter,
+                        loopExit, loop, phi, debug);
+                if (scaleLastIter == null) return null;
+            } else {
+                return null;
+            }
+            return phi.graph().addOrUniqueWithInputs(
+                    MathUtil.mul(phi.graph(), baseLastIter, scaleLastIter));
+
+        } else if (derivedIv instanceof DerivedScaledInductionVariable scaled) {
+            return phi.graph().addOrUniqueWithInputs(
+                    MathUtil.mul(phi.graph(), baseLastIter, scaled.getScale()));
+
+        } else if (derivedIv instanceof DerivedOffsetInductionVariable offset) {
+            return phi.graph().addOrUniqueWithInputs(
+                    offset.op(baseLastIter, offset.getOffset()));
+
+        } else if (derivedIv instanceof DerivedConvertedInductionVariable converted) {
+            return phi.graph().addOrUniqueWithInputs(
+                    jdk.graal.compiler.nodes.calc.IntegerConvertNode.convert(
+                            baseLastIter,
+                            converted.valueNode().stamp(NodeView.DEFAULT),
+                            phi.graph(),
+                            NodeView.DEFAULT));
+        }
+
+        debug.log(DebugContext.INFO_LEVEL,
+                "     [Skip] Unhandled derived IV type %s",
+                derivedIv.getClass().getSimpleName());
+        return null;
     }
 
     @Override
@@ -171,37 +224,23 @@ public class LoopFoldingPhase extends LoopPhase<LoopPolicies> {
             DebugContext debug = graph.getDebug();
 
             for (Loop loop : data.loops()) {
+                boolean peeled = loop.loopBegin().peelings() > 0;
+                if (!peeled) {
+                    debug.log(DebugContext.INFO_LEVEL,
+                            "  [Skip] Loop %s has not been peeled (peelings=%d), skipping",
+                            loop, loop.loopBegin().peelings());
+                    continue;
+                }
                 debug.log(DebugContext.INFO_LEVEL,
-                        "  [Loop] %s  counted=%b  IVs=%d",
-                        loop, loop.counted() != null, loop.getInductionVariables().size());
+                        "  [Loop] %s  counted=%b  peeled=%b  peelings=%d  IVs=%d",
+                        loop, loop.counted() != null, peeled,
+                        loop.loopBegin().peelings(),
+                        loop.getInductionVariables().size());
 
                 for (InductionVariable anyIv : loop.getInductionVariables().getValues()) {
                     if (anyIv instanceof BasicInductionVariable) continue;
-
-                    // Logging
-                    if (anyIv instanceof DerivedIVOffsetInductionVariable linear) {
-                        debug.log(DebugContext.INFO_LEVEL,
-                                "     [Linear]    node=%s  base=%s  second=%s",
-                                linear.valueNode(), linear.getBase().valueNode(),
-                                linear.getSecondIV().valueNode());
-                    } else if (anyIv instanceof DerivedScaledInductionVariable scaled) {
-                        debug.log(DebugContext.INFO_LEVEL,
-                                "     [Scaled]    node=%s  base=%s  scale=%s",
-                                scaled.valueNode(), scaled.getBase().valueNode(), scaled.getScale());
-                    } else if (anyIv instanceof DerivedOffsetInductionVariable offset) {
-                        debug.log(DebugContext.INFO_LEVEL,
-                                "     [Offset]    node=%s  base=%s  offset=%s",
-                                offset.valueNode(), offset.getBase().valueNode(), offset.getOffset());
-                    } else if (anyIv instanceof DerivedConvertedInductionVariable converted) {
-                        debug.log(DebugContext.INFO_LEVEL,
-                                "     [Converted] node=%s  base=%s",
-                                converted.valueNode(), converted.getBase().valueNode());
-                    }
-
                     tryReplaceDerivedIVPhi(loop, anyIv, debug);
                 }
-                debug.log(DebugContext.INFO_LEVEL,
-                        "==================================================");
             }
         }
     }
