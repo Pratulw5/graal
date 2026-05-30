@@ -34,6 +34,7 @@ import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.nodes.ConstantNode;
 import jdk.graal.compiler.nodes.LogicNode;
 import jdk.graal.compiler.nodes.NodeView;
+import jdk.graal.compiler.nodes.PhiNode;
 import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
 import jdk.graal.compiler.nodes.ValuePhiNode;
@@ -258,6 +259,9 @@ public class BasicInductionVariable extends InductionVariable {
     @Override
     public boolean structuralIntegrityValid() {
         return phi.isAlive() && init.isAlive() && rawStride.isAlive() && op.isAlive();
+    }
+    public PhiNode getPhi() {
+        return this.phi;
     }
 
 }

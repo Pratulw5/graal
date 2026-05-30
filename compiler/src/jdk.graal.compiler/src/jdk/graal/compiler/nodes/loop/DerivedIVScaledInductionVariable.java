@@ -1,5 +1,6 @@
 package jdk.graal.compiler.nodes.loop;
 
+import static jdk.graal.compiler.nodes.loop.MathUtil.mul;
 import java.util.Collection;
 
 import jdk.graal.compiler.core.common.type.IntegerStamp;
@@ -7,82 +8,60 @@ import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.nodes.LogicNode;
 import jdk.graal.compiler.nodes.NodeView;
-import jdk.graal.compiler.nodes.StructuredGraph;
 import jdk.graal.compiler.nodes.ValueNode;
-import jdk.graal.compiler.nodes.calc.BinaryNode;
 import jdk.graal.compiler.nodes.calc.IntegerConvertNode;
-import jdk.graal.compiler.nodes.calc.LeftShiftNode;
-import jdk.graal.compiler.nodes.calc.MulNode;
+import jdk.graal.compiler.nodes.util.GraphUtil;
 import jdk.graal.compiler.replacements.nodes.arithmetic.IntegerMulExactOverflowNode;
-import jdk.graal.compiler.phases.common.util.LoopUtility;
 
 /**
- * A derived induction variable of the form:
- *
- *   value = base * scaleIV   (MulNode)
- *   value = base << scaleIV  (LeftShiftNode where shift amount is an IV)
- *
- * Both base and scaleIV are induction variables of the same loop,
- * making this a nonlinear (quadratic) IV.
+ * An induction variable of the form {@code base * scaleIV}, where both {@code base} and
+ * {@code scaleIV} are themselves induction variables. Because the scale is not a loop-invariant
+ * constant, many constant-folding operations are unavailable; they throw
+ * {@link UnsupportedOperationException} rather than silently returning wrong answers.
  */
 public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
 
-    private final InductionVariable scaleIV;
+    /**
+     * The induction variable used as the scale factor. It must belong to the same loop (or an
+     * enclosing loop) so that it is accessible at every iteration where {@code base} is live.
+     */
+    protected final InductionVariable scaleIV;
+
+    /** The graph node that computes {@code base.valueNode() * scaleIV.valueNode()}. */
+    protected final ValueNode value;
+
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
 
     /**
-     * The actual graph node — either a MulNode or a LeftShiftNode.
-     * Common parent is BinaryNode (ShiftNode extends BinaryNode,
-     * MulNode extends BinaryArithmeticNode extends BinaryNode).
+     * @param loop    the loop this IV belongs to
+     * @param base    the base induction variable (what is being scaled)
+     * @param scaleIV the induction variable acting as the scale factor
+     * @param value   the pre-existing graph node representing {@code base * scaleIV}
      */
-    private final BinaryNode value;
-    private final boolean isShift;
-
     public DerivedIVScaledInductionVariable(Loop loop,
                                             InductionVariable base,
                                             InductionVariable scaleIV,
-                                            BinaryNode value) {
+                                            ValueNode value) {
         super(loop, base);
-        GraalError.guarantee(value instanceof MulNode || value instanceof LeftShiftNode,
-                "DerivedIVScaledInductionVariable only supports MulNode or LeftShiftNode, got: %s",
-                value.getClass().getSimpleName());
         this.scaleIV = scaleIV;
-        this.value = value;
-        this.isShift = value instanceof LeftShiftNode;
+        this.value   = value;
     }
 
     public InductionVariable getScaleIV() {
         return scaleIV;
     }
 
-    // -----------------------------------------------------------------------
-    // Core op helper — builds the right node type
-    // -----------------------------------------------------------------------
-
-    private ValueNode op(ValueNode b, ValueNode s) {
-        return op(b, s, true);
-    }
-
-    private ValueNode op(ValueNode b, ValueNode s, boolean gvn) {
-        if (isShift) {
-            LeftShiftNode node = new LeftShiftNode(b, s);
-            return gvn ? graph().addOrUniqueWithInputs(node) : node;
-        }
-        return MathUtil.mul(graph(), b, s, gvn);
-    }
-
-    // -----------------------------------------------------------------------
-    // valueNode / graph / structuralIntegrityValid
-    // -----------------------------------------------------------------------
-
     @Override
     public ValueNode valueNode() {
         return value;
     }
 
-    @Override
-    public StructuredGraph graph() {
-        return base.graph();
-    }
+    // -------------------------------------------------------------------------
+    // Structural integrity
+    // -------------------------------------------------------------------------
 
     @Override
     public boolean structuralIntegrityValid() {
@@ -91,9 +70,9 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
                 && value.isAlive();
     }
 
-    // -----------------------------------------------------------------------
-    // Direction — conservative null (nonlinear)
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Direction
+    // -------------------------------------------------------------------------
 
     @Override
     public Direction direction() {
@@ -106,45 +85,26 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
 
     @Override
     public ValueNode initNode() {
-        return op(base.initNode(), scaleIV.initNode());
+        // init = base.init * scaleIV.init
+        return mul(graph(), base.initNode(), scaleIV.initNode());
     }
-
-    @Override
-    public boolean isConstantInit() {
-        try {
-            if (base.isConstantInit() && scaleIV.isConstantInit()) {
-                constantInitSafe();
-                return true;
-            }
-        } catch (ArithmeticException e) {
-            // overflow
-        }
-        return false;
-    }
-
-    @Override
-    public long constantInit() {
-        return constantInitSafe();
-    }
-
-    private long constantInitSafe() throws ArithmeticException {
-        return opSafe(base.constantInit(), scaleIV.constantInit());
-    }
-
-    // -----------------------------------------------------------------------
-    // Stride — nonlinear, no constant stride
-    // -----------------------------------------------------------------------
 
     @Override
     public ValueNode strideNode() {
-        if (isShift) {
-            // approximate: stride(base) << scaleIV
-            return new LeftShiftNode(base.strideNode(), scaleIV.valueNode());
-        }
-        // product rule: stride(base)*scaleIV + base*stride(scaleIV)
-        ValueNode term1 = MathUtil.mul(graph(), base.strideNode(), scaleIV.valueNode());
-        ValueNode term2 = MathUtil.mul(graph(), base.valueNode(), scaleIV.strideNode());
-        return MathUtil.add(graph(), term1, term2);
+        // stride is NOT simply base.stride * scaleIV.stride;
+        // the product of two IVs is a quadratic expression, so we cannot
+        // represent its stride as a simple linear value.  Return null to
+        // signal "not a simple strided IV".
+        return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Constant-value queries  –  not supported when scale is an IV
+    // -------------------------------------------------------------------------
+
+    @Override
+    public boolean isConstantInit() {
+        return false;
     }
 
     @Override
@@ -153,48 +113,50 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
     }
 
     @Override
-    public long constantStride() {
-        throw GraalError.shouldNotReachHere(
-                "DerivedIVScaledInductionVariable has no constant stride — it is nonlinear");
-    }
-
-    // -----------------------------------------------------------------------
-    // Extremum
-    // -----------------------------------------------------------------------
-
-    @Override
     public boolean isConstantExtremum() {
-        try {
-            if (base.isConstantExtremum() && scaleIV.isConstantExtremum()) {
-                constantExtremumSafe();
-                return true;
-            }
-        } catch (ArithmeticException e) {
-            // overflow
-        }
         return false;
     }
 
     @Override
-    public long constantExtremum() {
-        return constantExtremumSafe();
+    public long constantInit() {
+        throw new UnsupportedOperationException(
+                "constantInit() is not available for DerivedIVScaledInductionVariable " +
+                        "because the scale is itself an induction variable.");
     }
 
-    private long constantExtremumSafe() throws ArithmeticException {
-        return opSafe(base.constantExtremum(), scaleIV.constantExtremum());
+    @Override
+    public long constantStride() {
+        throw new UnsupportedOperationException(
+                "constantStride() is not available for DerivedIVScaledInductionVariable " +
+                        "because the scale is itself an induction variable.");
     }
+
+    @Override
+    public long constantExtremum() {
+        throw new UnsupportedOperationException(
+                "constantExtremum() is not available for DerivedIVScaledInductionVariable " +
+                        "because the scale is itself an induction variable.");
+    }
+
+    // -------------------------------------------------------------------------
+    // Extremum nodes
+    // -------------------------------------------------------------------------
 
     @Override
     public ValueNode extremumNode(boolean assumeLoopEntered, Stamp stamp) {
-        return op(base.extremumNode(assumeLoopEntered, stamp),
-                scaleIV.extremumNode(assumeLoopEntered, stamp));
+        ValueNode baseExtremum  = base.extremumNode(assumeLoopEntered, stamp);
+        ValueNode scaleExtremum = IntegerConvertNode.convert(
+                scaleIV.extremumNode(assumeLoopEntered, stamp), stamp, graph(), NodeView.DEFAULT);
+        return mul(graph(), baseExtremum, scaleExtremum);
     }
 
     @Override
-    public ValueNode extremumNode(boolean assumeLoopEntered, Stamp stamp,
-                                  ValueNode maxTripCount) {
-        return op(base.extremumNode(assumeLoopEntered, stamp, maxTripCount),
-                scaleIV.extremumNode(assumeLoopEntered, stamp, maxTripCount));
+    public ValueNode extremumNode(boolean assumeLoopEntered, Stamp stamp, ValueNode maxTripCount) {
+        ValueNode baseExtremum  = base.extremumNode(assumeLoopEntered, stamp, maxTripCount);
+        ValueNode scaleExtremum = IntegerConvertNode.convert(
+                scaleIV.extremumNode(assumeLoopEntered, stamp, maxTripCount),
+                stamp, graph(), NodeView.DEFAULT);
+        return mul(graph(), baseExtremum, scaleExtremum);
     }
 
     @Override
@@ -208,24 +170,17 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
         GraalError.guarantee(baseExtremum != null,
                 "Expected base extremum for %s", this);
 
-        ValueNode scaleExtremum = scaleIV.extremumNode(
-                assumeLoopEntered, stamp, effectiveMaxTripCount);
+        // Convert the IV-scale extremum to the target stamp.
+        ValueNode scaleExtremum = IntegerConvertNode.convert(
+                scaleIV.extremumNode(assumeLoopEntered, stamp, effectiveMaxTripCount),
+                stamp, graph(), NodeView.DEFAULT);
 
-        if (!scaleExtremum.stamp(NodeView.DEFAULT).isCompatible(stamp)) {
-            scaleExtremum = IntegerConvertNode.convert(
-                    scaleExtremum, stamp, graph(), NodeView.DEFAULT);
+        LogicNode mulOverflow = IntegerMulExactOverflowNode.create(baseExtremum, scaleExtremum);
+        if (!mulOverflow.isContradiction()) {
+            conditions.add(graph().addOrUniqueWithInputs(mulOverflow));
         }
 
-        if (!isShift) {
-            // Overflow check only meaningful for multiplication
-            LogicNode mulOverflow = IntegerMulExactOverflowNode.create(
-                    baseExtremum, scaleExtremum);
-            if (!mulOverflow.isContradiction()) {
-                conditions.add(graph().addOrUniqueWithInputs(mulOverflow));
-            }
-        }
-
-        return op(baseExtremum, scaleExtremum);
+        return mul(graph(), baseExtremum, scaleExtremum);
     }
 
     // -----------------------------------------------------------------------
@@ -234,12 +189,7 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
 
     @Override
     public ValueNode exitValueNode() {
-        return op(base.exitValueNode(), scaleIV.exitValueNode());
-    }
-
-    @Override
-    public ValueNode entryTripValue() {
-        return op(base.entryTripValue(), scaleIV.entryTripValue());
+        return mul(graph(), base.exitValueNode(), scaleIV.exitValueNode());
     }
 
     // -----------------------------------------------------------------------
@@ -247,55 +197,36 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
     // -----------------------------------------------------------------------
 
     @Override
-    public ValueNode copyValue(InductionVariable newBase) {
-        return copyValue(newBase, true);
+    public void deleteUnusedNodes() {
+        GraphUtil.tryKillUnused(scaleIV.valueNode());
     }
 
-    @Override
-    public ValueNode copyValue(InductionVariable newBase, boolean gvn) {
-        return op(newBase.valueNode(), scaleIV.valueNode(), gvn);
-    }
+    // -------------------------------------------------------------------------
+    // Scale / offset helpers
+    // -------------------------------------------------------------------------
 
-    @Override
-    public InductionVariable copy(InductionVariable newBase, ValueNode newValue) {
-        if (newValue instanceof BinaryNode bin) {
-            return new DerivedIVScaledInductionVariable(loop, newBase, scaleIV, bin);
-        }
-        throw GraalError.shouldNotReachHere(
-                "Unexpected newValue type for DerivedIVScaledInductionVariable: "
-                        + newValue.getClass().getSimpleName());
-    }
-
-    @Override
-    public InductionVariable duplicate() {
-        InductionVariable newBase = base.duplicate();
-        return copy(newBase, copyValue(newBase, false));
-    }
-
-    @Override
-    public InductionVariable duplicateWithNewInit(ValueNode newInit) {
-        InductionVariable newBase = base.duplicateWithNewInit(newInit);
-        return copy(newBase, copyValue(newBase, false));
-    }
-
-    // -----------------------------------------------------------------------
-    // Scale / offset (conservative)
-    // -----------------------------------------------------------------------
-
+    /**
+     * A constant scale can only be determined if the scaleIV itself has a constant scale
+     * relative to {@code ref}, and the base also has a constant scale relative to {@code ref}.
+     */
     @Override
     public boolean isConstantScale(InductionVariable ref) {
-        return this == ref;
+        // Both legs must be constant-scale for the product to be constant-scale.
+        return scaleIV.isConstantScale(ref) && base.isConstantScale(ref);
     }
 
     @Override
     public long constantScale(InductionVariable ref) {
         assert isConstantScale(ref);
-        return 1;
+        return scaleIV.constantScale(ref) * base.constantScale(ref);
     }
 
     @Override
     public boolean offsetIsZero(InductionVariable ref) {
-        return this == ref;
+        if (super.offsetIsZero(ref)) {
+            return true;
+        }
+        return base.offsetIsZero(ref);
     }
 
     @Override
@@ -304,38 +235,45 @@ public class DerivedIVScaledInductionVariable extends DerivedInductionVariable {
         return null;
     }
 
-    // -----------------------------------------------------------------------
-    // Arithmetic helper
-    // -----------------------------------------------------------------------
-
-    private long opSafe(long b, long s) throws ArithmeticException {
-        int bits = IntegerStamp.getBits(value.stamp(NodeView.DEFAULT));
-        if (isShift) {
-            if (s < 0 || s >= bits) {
-                throw new ArithmeticException("Shift amount out of range: " + s);
-            }
-            return LoopUtility.multiplyExact(bits, b, 1L << s);
-        }
-        return LoopUtility.multiplyExact(bits, b, s);
-    }
-
-    // -----------------------------------------------------------------------
-    // Misc
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Copy / clone support
+    // -------------------------------------------------------------------------
 
     @Override
-    public void deleteUnusedNodes() {
-        // nothing owned exclusively
+    public ValueNode copyValue(InductionVariable newBase, boolean gvn) {
+        return MathUtil.mul(graph(), newBase.valueNode(), scaleIV.valueNode(), gvn);
     }
+
+    @Override
+    public ValueNode copyValue(InductionVariable newBase) {
+        return copyValue(newBase, true);
+    }
+
+    @Override
+    public InductionVariable copy(InductionVariable newBase, ValueNode newValue) {
+        return new DerivedIVScaledInductionVariable(loop, newBase, scaleIV, newValue);
+    }
+
+    // -------------------------------------------------------------------------
+    // Entry-trip value
+    // -------------------------------------------------------------------------
+
+    @Override
+    public ValueNode entryTripValue() {
+        return mul(graph(), base.entryTripValue(), scaleIV.entryTripValue());
+    }
+
+    // -------------------------------------------------------------------------
+    // Debugging
+    // -------------------------------------------------------------------------
 
     @Override
     public String toString(IVToStringVerbosity verbosity) {
-        String opSymbol = isShift ? "<<" : "*";
         if (verbosity == IVToStringVerbosity.FULL) {
-            return String.format(
-                    "DerivedIVScaledInductionVariable base=(%s) %s scaleIV=(%s)  node=%s",
-                    base, opSymbol, scaleIV, value);
+            return String.format("DerivedIVScaledInductionVariable base (%s) * scaleIV (%s)",
+                    base, scaleIV);
+        } else {
+            return String.format("(%s) * (%s)", base, scaleIV);
         }
-        return String.format("(%s) %s (%s)", base, opSymbol, scaleIV);
     }
 }
